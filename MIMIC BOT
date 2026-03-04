@@ -1,0 +1,288 @@
+import os
+import io
+import json
+import asyncio
+import tempfile
+import datetime
+from pathlib import Path
+from collections import defaultdict
+
+import discord
+from discord.ext import commands
+from openai import AsyncOpenAI
+from pydub import AudioSegment
+
+DISCORD_TOKEN  = "MTQ3ODE3NDYxMjk3MzAzMTYwNg.GjzxjA.Pcg8qaI7_JlfSCvgt9bIVor063MigtpIj52Hc4"
+OPENAI_API_KEY = "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"
+
+MAX_HISTORY   = 150
+MIMIC_CONTEXT = 60
+PROFILES_FILE = Path("user_profiles.json")
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+intents.voice_states = True
+
+bot    = commands.Bot(command_prefix="!", intents=intents)
+openai = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+user_profiles: dict[str, list[str]] = defaultdict(list)
+user_names: dict[str, str] = {}
+
+
+def load_profiles():
+    if PROFILES_FILE.exists():
+        data = json.loads(PROFILES_FILE.read_text())
+        for uid, msgs in data.items():
+            user_profiles[uid] = msgs
+        print(f"[profiles] Loaded {len(user_profiles)} user profiles.")
+
+def save_profiles():
+    PROFILES_FILE.write_text(json.dumps(dict(user_profiles), indent=2))
+
+def add_message(user_id: str, display_name: str, text: str):
+    text = text.strip()
+    if not text:
+        return
+    user_names[user_id] = display_name
+    user_profiles[user_id].append(text)
+    if len(user_profiles[user_id]) > MAX_HISTORY:
+        user_profiles[user_id] = user_profiles[user_id][-MAX_HISTORY:]
+
+
+async def transcribe_audio(pcm_bytes: bytes, sample_rate: int = 48000) -> str:
+    audio = AudioSegment(
+        data=pcm_bytes,
+        sample_width=2,
+        frame_rate=sample_rate,
+        channels=2,
+    )
+    audio = audio.set_channels(1).set_frame_rate(16000)
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        audio.export(f.name, format="wav")
+        tmp_path = f.name
+
+    try:
+        with open(tmp_path, "rb") as af:
+            result = await openai.audio.transcriptions.create(
+                model="whisper-1",
+                file=af,
+                response_format="text",
+            )
+        return result.strip() if result else ""
+    finally:
+        os.unlink(tmp_path)
+
+
+async def generate_mimic(target_id: str, target_name: str, prompt_hint: str = "") -> str:
+    messages = user_profiles.get(target_id, [])
+    if not messages:
+        return f"I don't have enough data on {target_name} yet. They need to talk more!"
+
+    sample = messages[-MIMIC_CONTEXT:]
+    example_block = "\n".join(f"- {m}" for m in sample)
+
+    system_prompt = (
+        f"You are roleplaying as a Discord user named {target_name}. "
+        "Study the example messages below and write ONE short Discord message "
+        "that perfectly mimics their vocabulary, grammar, humor, punctuation style, "
+        "use of slang/emoji, topic interests, and personality. "
+        "Do NOT use quotation marks. Just output the raw message. "
+        "Keep it under 200 characters unless their style is typically long.\n\n"
+        f"Example messages from {target_name}:\n{example_block}"
+    )
+
+    user_content = prompt_hint if prompt_hint else f"Write a typical message {target_name} might send right now."
+
+    response = await openai.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_content},
+        ],
+        max_tokens=200,
+        temperature=0.9,
+    )
+    return response.choices[0].message.content.strip()
+
+
+async def finished_recording(sink: discord.sinks.WaveSink, channel: discord.TextChannel, *args):
+    await channel.send("⏹️ Stopped. Transcribing… this may take a moment.")
+    for user_id, audio in sink.audio_data.items():
+        audio.file.seek(0)
+        raw = audio.file.read()
+        if len(raw) < 4096:
+            continue
+        member = channel.guild.get_member(user_id)
+        name = member.display_name if member else str(user_id)
+        try:
+            text = await transcribe_audio(raw)
+            if text:
+                print(f"[voice] {name}: {text}")
+                add_message(str(user_id), name, text)
+                await channel.send(f"📝 **{name}**: {text}")
+        except Exception as e:
+            print(f"[transcribe error] {user_id}: {e}")
+
+    save_profiles()
+    await channel.send("✅ Done! Profiles updated.")
+
+
+@bot.command(name="join")
+async def join_voice(ctx: commands.Context):
+    if not ctx.author.voice:
+        return await ctx.send("❌ You need to be in a voice channel first.")
+
+    vc_channel = ctx.author.voice.channel
+
+    if ctx.guild.voice_client:
+        await ctx.guild.voice_client.disconnect(force=True)
+        await asyncio.sleep(1)
+
+    vc = await vc_channel.connect()
+    await asyncio.sleep(2)
+    
+    print(f"[join] Connected: {vc.is_connected()}")
+    
+    if not vc.is_connected():
+        return await ctx.send("❌ Failed to stay connected to voice.")
+
+    vc.start_recording(
+        discord.sinks.WaveSink(),
+        finished_recording,
+        ctx.channel,
+    )
+    await ctx.send(f"🎙️ Joined **{vc_channel.name}** and recording! Use `!stop` to transcribe.")
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    if member == bot.user:
+        print(f"[voice] Bot state - before: {before.channel}, after: {after.channel}")
+        if before.channel and not after.channel:
+            import traceback
+            traceback.print_stack()
+
+
+@bot.command(name="stop")
+async def stop_recording(ctx: commands.Context):
+    vc = ctx.guild.voice_client
+    if not vc or not vc.is_connected():
+        return await ctx.send("❌ I'm not in a voice channel.")
+    vc.stop_recording()
+
+
+@bot.command(name="leave")
+async def leave_voice(ctx: commands.Context):
+    vc = ctx.guild.voice_client
+    if vc:
+        if vc.recording:
+            vc.stop_recording()
+        await vc.disconnect(force=True)
+        await ctx.send("👋 Left the voice channel.")
+    else:
+        await ctx.send("❌ I'm not in a voice channel.")
+
+
+@bot.command(name="mimic")
+async def mimic_user(ctx: commands.Context, member: discord.Member, *, hint: str = ""):
+    uid  = str(member.id)
+    name = member.display_name
+
+    if uid not in user_profiles or not user_profiles[uid]:
+        return await ctx.send(
+            f"🤷 No data on **{name}** yet — have them chat or use `!join` + `!stop` in voice."
+        )
+
+    async with ctx.typing():
+        message = await generate_mimic(uid, name, hint)
+
+    await ctx.send(f"🎭 **{name}** would probably say:\n> {message}")
+
+
+@bot.command(name="mimicloop")
+async def mimic_loop(ctx: commands.Context, member: discord.Member, count: int = 3):
+    uid  = str(member.id)
+    name = member.display_name
+
+    if uid not in user_profiles or not user_profiles[uid]:
+        return await ctx.send(f"🤷 No data on **{name}** yet.")
+
+    count = min(count, 8)
+    await ctx.send(f"🎭 Simulating **{name}** ({count} messages)…")
+    for _ in range(count):
+        async with ctx.typing():
+            msg = await generate_mimic(uid, name)
+        await ctx.send(f"> {msg}")
+        await asyncio.sleep(1.2)
+
+
+@bot.command(name="profile")
+async def show_profile(ctx: commands.Context, member: discord.Member = None):
+    target = member or ctx.author
+    uid    = str(target.id)
+    count  = len(user_profiles.get(uid, []))
+    recent = user_profiles.get(uid, [])[-3:]
+
+    embed = discord.Embed(
+        title=f"🧠 Profile: {target.display_name}",
+        color=discord.Color.blurple(),
+        timestamp=datetime.datetime.utcnow(),
+    )
+    embed.add_field(name="Messages learned", value=str(count), inline=True)
+    embed.add_field(
+        name="Recent samples",
+        value="\n".join(f'"{m}"' for m in recent) if recent else "None yet",
+        inline=False,
+    )
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="forget")
+async def forget_user(ctx: commands.Context, member: discord.Member = None):
+    target = member or ctx.author
+    if member and member != ctx.author and not ctx.author.guild_permissions.administrator:
+        return await ctx.send("❌ You need admin permissions to wipe someone else's profile.")
+    user_profiles.pop(str(target.id), None)
+    save_profiles()
+    await ctx.send(f"🗑️ Cleared profile for **{target.display_name}**.")
+
+
+@bot.command(name="mimichelp")
+async def mimic_help(ctx: commands.Context):
+    embed = discord.Embed(title="🎭 Mimic Bot Commands", color=discord.Color.gold())
+    cmds = [
+        ("!join",                "Join your voice channel and start recording"),
+        ("!stop",                "Stop recording and transcribe audio"),
+        ("!leave",               "Disconnect from voice"),
+        ("!mimic @user [hint]",  "Generate one message in the user's style"),
+        ("!mimicloop @user [n]", "Generate n messages in a row (max 8)"),
+        ("!profile [@user]",     "Show how much data the bot has on a user"),
+        ("!forget [@user]",      "Wipe a user's learned profile"),
+    ]
+    for name, desc in cmds:
+        embed.add_field(name=f"`{name}`", value=desc, inline=False)
+    await ctx.send(embed=embed)
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+    if not message.content.startswith("!"):
+        add_message(str(message.author.id), message.author.display_name, message.content)
+        if sum(len(v) for v in user_profiles.values()) % 50 == 0:
+            save_profiles()
+    await bot.process_commands(message)
+
+
+@bot.event
+async def on_ready():
+    load_profiles()
+    print(f"[bot] Logged in as {bot.user} (ID: {bot.user.id})")
+    print("[bot] Ready! Use !mimichelp for commands.")
+
+
+if __name__ == "__main__":
+    bot.run(DISCORD_TOKEN)
