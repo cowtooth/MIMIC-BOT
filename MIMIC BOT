@@ -12,8 +12,7 @@ from discord.ext import commands
 from openai import AsyncOpenAI
 from pydub import AudioSegment
 
-DISCORD_TOKEN  = "MTQ3ODE3NDYxMjk3MzAzMTYwNg.GjzxjA.Pcg8qaI7_JlfSCvgt9bIVor063MigtpIj52Hc4"
-OPENAI_API_KEY = "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"
+
 
 MAX_HISTORY   = 150
 MIMIC_CONTEXT = 60
